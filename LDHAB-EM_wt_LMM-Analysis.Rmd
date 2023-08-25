@@ -1,0 +1,566 @@
+---
+title: "LDHA/B EM wt LMM Analysis"
+author: "Erik"
+date: "2/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r introduction}
+#Sample: Mouse Optic Nerve
+#Immunogold (LDHA or LDHB) stained TEM images
+#Animal line: LDHAB_fl, LDHAB KO under CNP-Cre promotor
+#mut = LDHA and LDHB KO
+#ctr = wt littermates
+#Gold = Gold of LDHA and LDHB, respectively
+```
+
+```{r libraries, echo=FALSE}
+package_list <- c("tidyverse", "readxl", "ggpubr", "lme4", "here", "emmeans", "performance", "interactions", "lmerTest", "DHARMa", "reshape2", "simr")
+
+for (pkg in package_list) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  suppressPackageStartupMessages({
+    library(pkg, character.only = TRUE)
+  })
+}
+
+# Print current package versions
+package_versions <- lapply(package_list, function(x) paste(x, ":", as.character(packageVersion(x))))
+unlist(package_versions)
+```
+
+
+```{r load}
+#Imports excel file
+file = here::here("LDHAB_EM_ON_Quantification.xlsx")
+
+ldha <- read_excel(path = file, sheet = "OL - LDHA") %>%
+  group_by(Animal, Nr) %>%
+  summarise(
+    Image = first(Image),
+    Genotype = first(Genotype),
+    OligoCellBodyArea = sum(OligoCellBodyArea),
+    OligoNucleusArea = sum(OligoNucleusArea),
+    OligoArea = OligoCellBodyArea-OligoNucleusArea,
+    OligoGold = sum(OligoGold)
+  ) %>% 
+  full_join(
+    read_excel(path = file, sheet = "Axons - LDHA")) %>%
+  mutate(AxonDiameter = sqrt(AxonArea/pi)*2,
+         FiberDiameter = sqrt(FiberArea/pi)*2,
+         gRatio = AxonDiameter/FiberDiameter,
+         gRatio = AxonDiameter/FiberDiameter,
+         MyelinArea = FiberArea-AxonArea
+         )
+ldha
+```
+
+```{r LDHA - Linear Mixed Model -- Averaged over images}
+ldha_ctr <- ldha %>% subset(subset = Genotype == "ctr") %>%
+  dplyr::select(Animal, Image, AxonArea, AxonGold, MyelinArea, MyelinGold, AstrocyteArea, AstrocyteGold, OligoArea, OligoGold) %>%
+  group_by(Image) %>%
+  summarize(Animal = first(Animal),
+             across(matches("Gold|Area"), 
+                  list(mean = ~ mean(.,na.rm = TRUE)),
+                  .names = "{.fn}_{.col}"),
+            .groups = "drop") %>%
+   rename_with(~ sub("mean_", "", .x), .cols = starts_with("mean_")) %>%
+   pivot_longer(
+    cols = matches("(Area|Gold)"),
+    names_to = c("Type", ".value"),
+    names_pattern = "(.*)(Area|Gold)"
+  ) %>% 
+  add_column(StainingPerArea = .$Gold/.$Area) %>%
+  na.omit() %>%
+  rename(Staining = Gold)
+#write.csv(ldha_ctr, file = here("ldha_ctr.csv"), row.names = FALSE)
+data <- ldha_ctr
+
+# Fit a Linear Mixer Model
+model <- lmer(StainingPerArea ~ Type + (1|Animal) + (1|Animal:Type), data = data)
+
+# Results Cell Type
+summary(model) # Check the model summary
+anova(model) # Compute ANOVA
+emm <- emmeans(model, ~ Type) # Compute the estimated marginal means
+pairs(emm) # Perform pairwise comparisons
+
+
+ggplot(data, aes(x = Area, y = Staining, color = Type)) +
+  geom_point() +
+  labs(x = "Area", y = "Staining", color = "Type")
+
+# Create a new dataset for predictions
+prediction <- expand.grid(Area = seq(min(data$Area), max(data$Area), length.out = 100),
+                       Type = unique(data$Type),
+                       Animal = unique(data$Animal))
+
+# Add predictions from the models
+prediction$Staining <- predict(model, newdata = prediction) * prediction$Area
+prediction$StainingDensity <- predict(model, newdata = prediction)
+
+
+# Plot the data and the fitted models
+ggplot(data, aes(x = Area, y = Staining, color = Type)) +
+  geom_point() +
+  geom_line(data = prediction, aes(x = Area, y = Staining, color = Type), linetype = "solid", size = 3.5, alpha = 0.3) +
+  labs(x = "Area", y = "Staining", color = "Type", title = "LDHA - Images")
+
+ggplot(data, aes(x = Area, y = StainingPerArea, color = Type)) +
+  geom_point() +
+  geom_line(data = prediction, aes(x = Area, y = StainingDensity, color = Type), linetype = "solid", size = 3.5, alpha = 0.3) +
+  labs(x = "Area", y = "Staining Density", color = "Type", title = "LDHA - Images")
+```
+
+
+```{r testing LDHA staining Averages over images}
+# Visual check of model assumptions
+check_model(model) 
+
+# Check residuals
+plot(residuals(model))
+qqnorm(resid(model))
+qqline(resid(model))
+
+# Create simulated residuals
+simulationOutput <- simulateResiduals(fittedModel = model)
+
+# Check for dispersion
+testDispersion(simulationOutput)
+
+# Check for uniformity of residuals
+testUniformity(simulationOutput)
+
+# Create diagnostic plots
+plot(simulationOutput)
+```
+
+```{r LDHA - Averaging }
+# Averages over each image
+# Note: Because there is only one oligo quantified per image, no StDev needs to be
+#       taken for oligodendrocytes at this level. 
+ldhaImages <- ldha %>%
+  dplyr::select(-OligoCellBodyArea, -OligoNucleusArea, -matches("Gap")) %>%
+  mutate(AxonGoldDensity = AxonGold/AxonArea,
+         MyelinGoldDensity = MyelinGold/MyelinArea,
+         AstrocyteGoldDensity = AstrocyteGold/AstrocyteArea,
+         OligoGoldDensity = OligoGold/OligoArea,
+         OligoGold = OligoGold) %>%
+  group_by(Image) %>%
+  summarize(Animal = first(Animal),
+            Image = first(Image),
+            Genotype = first(Genotype),
+            across(matches("Gold|Area"), 
+                  list(mean = ~ mean(.,na.rm = TRUE),
+                        StDev = ~ sd(., na.rm = TRUE)),
+                  .names = "{.fn}_{.col}"),
+            .groups = "drop") %>%
+  arrange(Genotype)
+ldhaImages
+  
+# Averages over each animal
+# SEM for error propagation
+# StDev for Oligodendrocytes (because it is the first averaging)
+ldhaAnimals <- ldhaImages %>%
+  group_by(Animal) %>%
+  summarize(Animal = first(Animal),
+            ImageNr = n(),
+            Genotype = first(Genotype),
+            across(matches("^mean"),
+              list(mean = ~ mean(., na.rm = TRUE),
+                   StDev = ~ sd(., na.rm = TRUE),
+                   SEM = ~ sd(., na.rm = TRUE) / sqrt(sum(!is.na(.)))
+                   ), 
+              .names = "{.fn}_{.col}"
+            ),
+            .groups = "drop")  %>%
+  rename_with(~ sub("mean_mean_", "mean_", .x), .cols = starts_with("mean_mean_")) %>%
+  rename_with(~ sub("StDev_mean_", "StDev_", .x), .cols = starts_with("StDev_mean_")) %>%
+  rename_with(~ sub("SEM_mean_", "SEM_", .x), .cols = starts_with("SEM_mean_")) %>%
+  arrange(Genotype)
+ldhaAnimals
+
+# Averages over each genotype
+ldhaGenotype <- ldhaAnimals %>%
+  group_by(Genotype) %>%
+  summarize(AnimalNr = n(),
+            ImageNr = sum(ImageNr),
+            across(matches("^mean"),
+              list(mean = ~ mean(., na.rm = TRUE),
+                   StDev = ~ sd(., na.rm = TRUE),
+                   SEM = ~ sd(., na.rm = TRUE) / sqrt(sum(!is.na(.)))
+                   ),
+              .names = "{.fn}_{.col}"
+            ),
+            .groups = "drop") %>%
+  rename_with(~ sub("mean_mean_", "mean_", .x), .cols = starts_with("mean_mean_")) %>%
+  rename_with(~ sub("StDev_mean_", "StDev_", .x), .cols = starts_with("StDev_mean_")) %>%
+  rename_with(~ sub("SEM_mean_", "SEM_", .x), .cols = starts_with("SEM_mean_"))
+
+ldhaGenotype
+```
+
+```{r gRatio - LMM}
+df_gRatio <- ldha %>%
+  dplyr::select(Animal, Image, Genotype, AxonDiameter, FiberDiameter, gRatio) %>%
+  filter(!is.na(FiberDiameter)) %>% # Exclude all rows that don't contain gRatio measurements
+  filter(!grepl("Neg", Image)) %>% # Excludes negative controls
+  mutate(gRatio = AxonDiameter/FiberDiameter) %>%
+  mutate(Genotype = as.factor(Genotype),
+         Animal = as.factor(Animal))
+df_gRatio
+
+# Fit a Linear Mixer Model
+model <- lmer(gRatio ~ AxonDiameter * Genotype + (1 | Animal), data = df_gRatio)
+
+# Predict the fiber diameter
+df_gRatio$EstimatedGRatio <- predict(model, newdata = df_gRatio)
+
+# Compute the estimated g-Ratio
+df_gRatio$EstimatedFiberDiameter <- df_gRatio$AxonDiameter  / df_gRatio$EstimatedGRatio
+
+# Results
+summary(model) # Check the model summary
+anova(model) # Compute ANOVA
+
+# Compute the estimated marginal means for the interaction
+emm_int <- emmeans(model, ~ Genotype:AxonDiameter)
+summary(emm_int)
+pairs(emm_int) # Perform pairwise comparisons
+
+# Test the fit
+AIC(model)
+best_model <- lmerTest::step(model, direction="both")
+summary(best_model)
+
+```
+
+```{r gRatio - Plot}
+data <- df_gRatio
+ggplot(data, aes(x = AxonDiameter, y = gRatio, color = Genotype)) +
+  geom_point() +
+  geom_smooth(method = "lm", aes(group = Genotype), se = FALSE) +
+  labs(x = "AxonDiameter", y = "gRatio", color = "Genotype") +
+  scale_color_manual(values = c("ctr" = "red", "mut" = "blue")) +
+  xlim(0, 2.4) +
+  ylim(0, 1) +
+  theme_minimal()
+
+# Create a new dataset for predictions
+prediction <- expand.grid(AxonDiameter = seq(min(data$AxonDiameter), max(data$AxonDiameter), length.out = 100),
+                       Animal = unique(data$Animal),
+                       Genotype = unique(data$Genotype))
+
+# Add predictions from the models
+prediction$Pred_Model <- predict(model, newdata = prediction)
+prediction$gRatio <- prediction$Pred_Model
+
+# Plot the data and the fitted models
+ggplot(data, aes(x = AxonDiameter, y = gRatio, color = Genotype)) +
+  geom_point() +
+  geom_line(data = prediction, aes(y = gRatio), linetype = "solid", size = 3.5, alpha = 0.3) +
+  labs(x = "AxonDiameter", y = "gRatio", color = "Genotype") +
+  xlim(0, 2.4) +
+  ylim(0, 1) +
+  scale_color_manual(values = c("ctr" = "red", "mut" = "blue")) +
+  theme_minimal()
+```
+
+```{r testing gRatio}
+# Visual check of model assumptions
+check_model(model) 
+
+# Check residuals
+plot(residuals(model))
+qqnorm(resid(model))
+qqline(resid(model))
+
+# Create simulated residuals
+simulationOutput <- simulateResiduals(fittedModel = model)
+
+# Check for dispersion
+testDispersion(simulationOutput)
+
+# Check for uniformity of residuals
+testUniformity(simulationOutput)
+
+# Create diagnostic plots
+plot(simulationOutput)
+```
+
+```{r RNAscope LDHA}
+#Imports excel file
+rnaFile = here::here("LDHAB_RNAscope_Quantification.xlsx")
+
+ldha_Rna <- read_excel(path = rnaFile, sheet = "LDHA") %>%
+  mutate(CellID = row_number()) %>%
+  pivot_longer(
+    cols = -CellID, # Exclude CellID from the reshaping
+    names_to = c("Genotype", "Animal"), # New column names
+    names_pattern = "(wt|KO) (.*)" # Regular expression to match and separate genotype and animal number
+  ) %>%
+  rename(RnaDots = value)
+ldha_Rna$Genotype[which(ldha_Rna$Genotype == "KO")] <- "mut"
+
+
+ldha_Rna <- ldha_Rna %>%
+  mutate(Animal = paste(Genotype, Animal, sep = " - "))
+
+# Convert Genotype to factor
+ldha_Rna$Genotype <- as.factor(ldha_Rna$Genotype)
+
+# Negative Binomial GLMM
+model <- glmer.nb(RnaDots ~ Genotype + (1|Animal), data = ldha_Rna)
+
+# Results Cell Type
+summary(model) # Check the model summary
+anova(model) # Compute ANOVA
+
+# Obtain the EMMs
+emm <- emmeans(model, ~ Genotype)
+pairs(emm) # Perform pairwise comparisons
+
+# Transform the estimates
+emm_exp <- regrid(emm, transform = "response")
+
+# Print the results
+summary(emm_exp)
+
+# Calculate contrasts
+contrasts <- contrast(emm_exp, method = "pairwise")
+
+# Print the results
+summary(contrasts)
+
+
+# Visual check of model assumptions
+check_model(model) 
+
+# Check residuals
+plot(residuals(model))
+qqnorm(resid(model))
+qqline(resid(model))
+
+data <- ldha_Rna
+ggplot(data, aes(x = Genotype, y = RnaDots, color = Genotype)) +
+  geom_point() +
+  labs(x = "Genotype", y = "RnaDots", color = "Genotype") +
+  theme_minimal()
+
+# Create a new dataset for predictions
+prediction <- expand.grid(Genotype = unique(data$Genotype),
+                       Animal = unique(data$Animal))
+
+# Add predictions from the models
+prediction$Pred_Model <- predict(model, newdata = prediction)
+
+# Plot the data and the fitted models
+ggplot(data, aes(x = Genotype, y = RnaDots, color = Genotype)) +
+  geom_point() +
+  geom_line(data = prediction, aes(x = Genotype, y = Pred_Model, color = Genotype), linetype = "solid", size = 3.5, alpha = 0.8) +
+  labs(x = "Genotype", y = "RnaDots", color = "Genotype", title = "LDHA - RNAscope")
+
+```
+
+```{r RNAscope Ldhb}
+ldhb_Rna <- read_excel(path = rnaFile, sheet = "LDHB") %>%
+  mutate(CellID = row_number()) %>%
+  pivot_longer(
+    cols = -CellID, # Exclude CellID from the reshaping
+    names_to = c("Genotype", "Animal"), # New column names
+    names_pattern = "(wt|KO) (.*)" # Regular expression to match and separate genotype and animal number
+  ) %>%
+  rename(RnaDots = value)
+ldhb_Rna$Genotype[which(ldhb_Rna$Genotype == "KO")] <- "mut"
+
+
+ldhb_Rna <- ldhb_Rna %>%
+  mutate(Animal = paste(Genotype, Animal, sep = " - "))
+
+# Convert Genotype to factor
+ldhb_Rna$Genotype <- as.factor(ldhb_Rna$Genotype) %>%
+  relevel(ref = "wt")
+
+# Negative Binomial GLMM
+model <- glmer.nb(RnaDots ~ Genotype + (1|Animal), data = ldhb_Rna)
+
+# Results Cell Type
+summary(model) # Check the model summary
+anova(model) # Compute ANOVA
+
+# Obtain the EMMs
+emm <- emmeans(model, ~ Genotype)
+pairs(emm) # Perform pairwise comparisons
+
+# Transform the estimates
+emm_exp <- regrid(emm, transform = "response")
+
+# Print the results
+summary(emm_exp)
+
+# Calculate contrasts
+contrasts <- contrast(emm_exp, method = "pairwise")
+
+# Print the results
+summary(contrasts)
+
+# Visual check of model assumptions
+check_model(model) 
+
+# Check residuals
+plot(residuals(model))
+qqnorm(resid(model))
+qqline(resid(model))
+
+data <- ldhb_Rna
+ggplot(data, aes(x = Genotype, y = RnaDots, color = Genotype)) +
+  geom_point() +
+  labs(x = "Genotype", y = "RnaDots", color = "Genotype") +
+  theme_minimal()
+
+# Create a new dataset for predictions
+prediction <- expand.grid(Genotype = unique(data$Genotype),
+                       Animal = unique(data$Animal))
+
+# Add predictions from the models
+prediction$Pred_Model <- predict(model, newdata = prediction)
+
+# Plot the data and the fitted models
+ggplot(data, aes(x = Genotype, y = RnaDots, color = Genotype)) +
+  geom_point() +
+  geom_line(data = prediction, aes(x = Genotype, y = Pred_Model, color = Genotype), linetype = "solid", size = 3.5, alpha = 0.8) +
+  labs(x = "Genotype", y = "RnaDots", color = "Genotype", title = "LDHB - RNAscope")
+
+```
+
+```{r testing RNAscope}
+# Create simulated residuals
+simulationOutput <- simulateResiduals(fittedModel = model)
+
+# Check for dispersion
+testDispersion(simulationOutput)
+
+# Check for uniformity of residuals
+testUniformity(simulationOutput)
+
+# Create diagnostic plots
+plot(simulationOutput)
+```
+
+
+```{r LDHA Oligodendrocytes with CA2}
+#Imports excel file
+LDHAB_ON_CA2_file <- "LDHAB_EM_ON_CAII_Quantification.xlsx"
+ldha_OL_CA2 <- read_excel(path = here::here(LDHAB_ON_CA2_file), sheet = "LDHA") %>%
+  mutate(Staining = "LDHA")
+
+#ldh_OL_CA2 <- dplyr::bind_rows(ldha_OL_CA2,ldhb_OL_CA2)
+
+model <- lmer(goldDotsPerArea ~ Genotype + (1|Mouse) + (1|Mouse:Genotype), data = ldha_OL_CA2)
+summary(model)
+anova(model)
+
+# Pairwise compaison
+emm <- emmeans(model, ~ Genotype)
+pairs(emm)
+
+data <- ldha_OL_CA2
+# Create a new dataset for predictions
+prediction <- data %>%
+  dplyr::select(Genotype, Mouse, Area) %>%
+  distinct()
+
+# Add predictions from the models
+prediction$Pred_Model <- predict(model, newdata = prediction) /prediction$Area
+
+lowerLimit_mut <- prediction %>%
+  dplyr::filter(Genotype == "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == min(Pred_Model))
+upperLimit_mut <- prediction %>%
+  dplyr::filter(Genotype == "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == max(Pred_Model))
+lowerLimit_ctr <- prediction %>%
+  dplyr::filter(Genotype != "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == min(Pred_Model))
+upperLimit_ctr <- prediction %>%
+  dplyr::filter(Genotype != "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == max(Pred_Model))
+  
+prediction$Pred_Model[seq(from = 1, to = length(prediction$Pred_Model), by = 2)]
+# Plot the data and the fitted models
+ggplot(data, aes(x = Area, y = goldDots, color = Genotype)) +
+  geom_point() +
+  geom_line(data = lowerLimit_mut, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = upperLimit_mut, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = upperLimit_ctr, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = lowerLimit_ctr, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  labs(x = "Area", y = "goldDots", color = "Genotype", title = "LDHA-EM - OL")
+
+```
+
+```{r LDHB Oligodendrocytes with CA2}
+#Imports excel file
+ldhb_OL_CA2 <- read_excel(path = here::here(LDHAB_ON_CA2_file), sheet = "LDHB") %>%
+  mutate(goldDotsPerArea = goldDots / Area) %>%
+  na.omit
+
+dependentVar <- "goldDotsPerArea"
+fixedEffect <- "Genotype"
+groupingVars <- (c("Mouse", "Genotype"))
+analysisName <- "LDHB_OLs+CA2"
+formula <- goldDotsPerArea ~ Genotype + (1|Mouse) + (1|Mouse:Genotype)
+Interaction <- NULL
+
+model <- lmer(goldDotsPerArea ~ Genotype + (1|Mouse) + (1|Mouse:Genotype), data = ldhb_OL_CA2)
+summary(model)
+anova(model)
+emm <- emmeans(model, ~ Genotype)
+pairs(emm)
+
+data <- ldhb_OL_CA2
+# Create a new dataset for predictions
+prediction <- data %>%
+  dplyr::select(Genotype, Mouse, Area) %>%
+  distinct()
+
+# Add predictions from the models
+prediction$Pred_Model <- predict(model, newdata = prediction) /prediction$Area
+
+lowerLimit_mut <- prediction %>%
+  dplyr::filter(Genotype == "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == min(Pred_Model))
+upperLimit_mut <- prediction %>%
+  dplyr::filter(Genotype == "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == max(Pred_Model))
+lowerLimit_ctr <- prediction %>%
+  dplyr::filter(Genotype != "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == min(Pred_Model))
+upperLimit_ctr <- prediction %>%
+  dplyr::filter(Genotype != "mut") %>%
+  dplyr::group_by(Area) %>%
+  dplyr::filter(Pred_Model == max(Pred_Model))
+  
+# Plot the data and the fitted models
+ggplot(data, aes(x = Area, y = goldDots, color = Genotype)) +
+  geom_point() +
+  geom_line(data = prediction, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = lowerLimit_mut, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = upperLimit_mut, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = upperLimit_ctr, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  geom_line(data = lowerLimit_ctr, aes(x = Area, y = Pred_Model, color = Genotype), linetype = "dashed", size = 1, alpha = 0.8) +
+  labs(x = "Area", y = "goldDots", color = "Genotype", title = "LDHB-EM - OL")
+```
