@@ -3,8 +3,8 @@ title: "LDHA/B LMM Analysis"
 author: "Späte et al. 2023"
 date: "2023"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 ---
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -23,12 +23,12 @@ knitr::opts_chunk$set(echo = TRUE)
 package_list <- c("tidyverse", "readxl", "ggpubr", "lme4", "here", "emmeans", "performance", "interactions", "lmerTest", "DHARMa", "reshape2", "simr")
 
 for (pkg in package_list) {
-  if (!require(pkg, character.only = TRUE)) {
-    install.packages(pkg, dependencies = TRUE)
-  }
-  suppressPackageStartupMessages({
+  suppressWarnings(suppressMessages({
+    if (!require(pkg, character.only = TRUE)) {
+      install.packages(pkg, dependencies = TRUE)
+    }
     library(pkg, character.only = TRUE)
-  })
+  }))
 }
 
 # Print current package versions
