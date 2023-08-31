@@ -1,7 +1,7 @@
 ---
-title: "LDHA/B EM wt LMM Analysis"
-author: "Erik"
-date: "2/2022"
+title: "LDHA/B LMM Analysis"
+author: "Späte et al. 2023"
+date: "2023"
 output:
   pdf_document: default
   html_document: default
